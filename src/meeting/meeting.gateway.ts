@@ -1,96 +1,123 @@
-// src/meeting/meeting.gateway.ts
 import {
   WebSocketGateway,
-  WebSocketServer,
   SubscribeMessage,
   MessageBody,
   ConnectedSocket,
-  OnGatewayInit,
-  OnGatewayConnection,
+  WebSocketServer,
   OnGatewayDisconnect,
+  OnGatewayConnection,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { meetings } from './meeting.service'; // import in-memory meeting store
+import { verifySocketToken } from '../auth/utils/jwt-socket-auth';
 
 @WebSocketGateway({ cors: true })
 export class MeetingGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+  implements OnGatewayConnection, OnGatewayDisconnect
 {
   @WebSocketServer()
   server: Server;
 
-  handleConnection(socket: Socket) {
-    console.log(`Client connected: ${socket.id}`);
+  // meetingId -> Set of socket IDs in the meeting
+  private rooms = new Map<string, Set<string>>();
+
+  // Handle socket connection + authentication
+  async handleConnection(client: Socket) {
+    const token = client.handshake.auth?.token;
+
+    try {
+      const user = verifySocketToken(token);
+      (client as any).user = user; // Attach user info to socket
+    } catch (err) {
+      client.emit('unauthorized', { message: 'Invalid or missing token' });
+      client.disconnect(true);
+    }
   }
 
-  handleDisconnect(socket: Socket) {
-    console.log(`Client disconnected: ${socket.id}`);
-    // Optional: remove user from rooms
-  }
-
-  afterInit(server: Server) {
-    console.log('WebSocket Gateway Initialized');
-  }
-
-  // 1. Join request from guest
-  @SubscribeMessage('join-request')
+  @SubscribeMessage('join-meeting')
   handleJoinRequest(
-    @MessageBody()
-    data: {
-      meetingId: string;
-      userId: string;
-      username: string;
-      email: string;
-    },
-    @ConnectedSocket() socket: Socket,
+    @MessageBody() data: { meetingId: string },
+    @ConnectedSocket() client: Socket,
   ) {
-    const meeting = meetings[data.meetingId];
-    if (!meeting) return;
+    const user = (client as any).user;
+    if (!user) {
+      client.emit('unauthorized', { message: 'Not authenticated' });
+      return;
+    }
 
-    meeting.participants[data.userId] = {
-      approved: false,
-      socketId: socket.id,
-    };
+    const { meetingId } = data;
 
-    // Send join request to host
-    this.server.to(meeting.hostId).emit('join-request', {
-      userId: data.userId,
-      username: data.username,
-      email: data.email,
-      socketId: socket.id,
+    if (!this.rooms.has(meetingId)) {
+      this.rooms.set(meetingId, new Set());
+    }
+
+    // Notify host that someone wants to join
+    this.server.to(meetingId).emit('join-request', {
+      socketId: client.id,
+      user, // Optional: send user info to host
     });
   }
 
-  // 2. Host approves or denies
-  @SubscribeMessage('join-response')
-  handleJoinResponse(
-    @MessageBody() data: { meetingId: string; userId: string; allow: boolean },
-    @ConnectedSocket() hostSocket: Socket,
+  @SubscribeMessage('approve-join')
+  handleApproval(
+    @MessageBody() data: { meetingId: string; guestSocketId: string },
+    @ConnectedSocket() host: Socket,
   ) {
-    const meeting = meetings[data.meetingId];
-    if (!meeting) return;
+    const user = (host as any).user;
+    if (!user) {
+      host.emit('unauthorized', { message: 'Not authenticated' });
+      return;
+    }
 
-    const participant = meeting.participants[data.userId];
-    if (!participant) return;
+    const { meetingId, guestSocketId } = data;
 
-    participant.approved = data.allow;
+    if (!this.rooms.has(meetingId)) {
+      this.rooms.set(meetingId, new Set());
+    }
 
-    if (!participant.socketId) return;
-    // Notify guest
-    this.server.to(participant.socketId).emit('join-result', {
-      approved: data.allow,
+    this.rooms.get(meetingId)?.add(host.id);
+    this.rooms.get(meetingId)?.add(guestSocketId);
+
+    host.join(meetingId);
+    this.server.sockets.sockets.get(guestSocketId)?.join(meetingId);
+
+    this.server.to(guestSocketId).emit('join-approved', {
+      meetingId,
     });
   }
 
-  // 3. Relay signaling data (offer/answer/ice)
   @SubscribeMessage('signal')
   handleSignal(
-    @MessageBody() data: { to: string; from: string; signal: any },
-    @ConnectedSocket() socket: Socket,
+    @MessageBody()
+    data: {
+      to: string;
+      from: string;
+      signal: any;
+    },
+    @ConnectedSocket() client: Socket,
   ) {
-    this.server.to(data.to).emit('signal', {
-      from: data.from,
-      signal: data.signal,
-    });
+    const user = (client as any).user;
+    if (!user) {
+      client.emit('unauthorized', { message: 'Not authenticated' });
+      return;
+    }
+
+    const { to, from, signal } = data;
+    this.server.to(to).emit('signal', { from, signal });
+  }
+
+  handleDisconnect(client: Socket) {
+    for (const [meetingId, participants] of this.rooms.entries()) {
+      if (participants.has(client.id)) {
+        participants.delete(client.id);
+
+        this.server.to(meetingId).emit('user-disconnected', {
+          socketId: client.id,
+        });
+
+        if (participants.size === 0) {
+          this.rooms.delete(meetingId);
+        }
+      }
+    }
   }
 }
