@@ -11,6 +11,7 @@ async function bootstrap() {
   app.enableCors({
     origin: [
       'http://localhost:3000', // local frontend
+      'https://frontend-lvc.vercel.app', // production frontend
     ],
     credentials: true,
   });

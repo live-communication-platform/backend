@@ -55,4 +55,12 @@ export class AuthService {
       throw error;
     }
   }
+
+  async getUserById(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    return user;
+  }
 }
