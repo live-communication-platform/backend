@@ -59,6 +59,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() payload: ChatMessage,
     @ConnectedSocket() client: Socket,
   ): void {
+    this.logger.log(`Received from client: ${JSON.stringify(payload)}`);
     const message: ChatMessage = {
       user: payload.user,
       text: payload.text,
@@ -66,6 +67,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
 
     this.logger.log(`[${message.user}]: ${message.text}`);
+    this.logger.log('Emitting newMessage to all clients:', message);
 
     // Emit message to all connected clients
     this.server.emit('newMessage', message);
